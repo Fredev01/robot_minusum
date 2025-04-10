@@ -11,6 +11,10 @@
 #define LOX2_ADDRESS 0x31
 #define LOX3_ADDRESS 0x32
 
+// Pines para sensores TCRT5000 (detección de borde)
+#define TCRT_FRONT A0 // Sensor frontal de línea
+#define TCRT_BACK A1  // Sensor trasero de línea
+
 // Pines para L298N - Un módulo para controlar 2 pares de motores
 // Motor A (Par Izquierdo)
 const int IN1 = 7;
@@ -23,10 +27,11 @@ const int IN4 = 10;
 const int ENB = 5; // Pin PWM para velocidad motores derechos
 
 // Velocidades para diferentes acciones
-const int ATTACK_SPEED = 255; // Velocidad máxima para ataque
-const int TURN_SPEED = 200;   // Velocidad para giros
-const int SEARCH_SPEED = 100; // Velocidad baja para búsqueda
-const int ESCAPE_SPEED = 180; // Velocidad para maniobras de escape
+const int ATTACK_SPEED = 255;       // Velocidad máxima para ataque
+const int TURN_SPEED = 200;         // Velocidad para giros
+const int SEARCH_SPEED = 100;       // Velocidad baja para búsqueda
+const int ESCAPE_SPEED = 180;       // Velocidad para maniobras de escape
+const int EDGE_RETREAT_SPEED = 220; // Velocidad para retirarse del borde
 
 // Crear objetos para sensores
 VL53L0X sensor1; // Frontal
@@ -42,129 +47,165 @@ const unsigned long STUCK_TIMEOUT = 3000;      // Tiempo para detectar estancami
 
 // Variables para almacenar mediciones
 uint16_t dist1, dist2, dist3;
+bool tcrtFrontValue, tcrtBackValue;
 
 // Variables de control
 unsigned long lastSearchChange = 0; // Tiempo de último cambio de dirección de búsqueda
 unsigned long lastMoveChange = 0;   // Tiempo de último cambio de movimiento
 bool searchDirection = true;        // true = horario, false = antihorario
 bool isStuck = false;               // Bandera de estancamiento
+bool edgeDetected = false;          // Bandera de detección de borde
 
-void setup()
+// Prioridades para acciones
+const int PRIORITY_EDGE = 1;   // Máxima prioridad: evitar salirse del dohyo
+const int PRIORITY_ATTACK = 2; // Segunda prioridad: atacar al oponente
+const int PRIORITY_SEARCH = 3; // Menor prioridad: buscar al oponente
+
+// Variable para almacenar la acción actual
+int currentAction = PRIORITY_SEARCH;
+
+void moveForward(int speed)
 {
-  Serial.begin(9600); // Iniciar comunicación serial
+  // Par izquierdo adelante
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  analogWrite(ENA, speed);
 
-  // Configurar pines de motores como salidas
-  pinMode(IN1, OUTPUT);
-  pinMode(IN2, OUTPUT);
-  pinMode(IN3, OUTPUT);
-  pinMode(IN4, OUTPUT);
-  pinMode(ENA, OUTPUT);
-  pinMode(ENB, OUTPUT);
-
-  // Apagar motores inicialmente
-  stopMotors();
-
-  // Configurar pines XSHUT como salidas
-  pinMode(XSHUT_PIN1, OUTPUT);
-  pinMode(XSHUT_PIN2, OUTPUT);
-  pinMode(XSHUT_PIN3, OUTPUT);
-
-  // Apagar todos los sensores
-  digitalWrite(XSHUT_PIN1, LOW);
-  digitalWrite(XSHUT_PIN2, LOW);
-  digitalWrite(XSHUT_PIN3, LOW);
-  delay(10);
-
-  // Iniciar Wire/I2C
-  Wire.begin();
-
-  // === INICIALIZAR SENSORES UNO POR UNO ===
-
-  // Inicializar sensor frontal
-  digitalWrite(XSHUT_PIN1, HIGH);
-  delay(20);
-  if (!sensor1.init())
-  {
-    Serial.println("Error inicializando sensor frontal");
-  }
-  sensor1.setAddress(LOX1_ADDRESS);
-  sensor1.setTimeout(50);
-
-  // Inicializar sensor izquierdo
-  digitalWrite(XSHUT_PIN2, HIGH);
-  delay(20);
-  if (!sensor2.init())
-  {
-    Serial.println("Error inicializando sensor izquierdo");
-  }
-  sensor2.setAddress(LOX2_ADDRESS);
-  sensor2.setTimeout(50);
-
-  // Inicializar sensor derecho
-  digitalWrite(XSHUT_PIN3, HIGH);
-  delay(20);
-  if (!sensor3.init())
-  {
-    Serial.println("Error inicializando sensor derecho");
-  }
-  sensor3.setAddress(LOX3_ADDRESS);
-  sensor3.setTimeout(50);
-
-  // Configurar sensores para modo rápido
-  sensor1.setMeasurementTimingBudget(20000); // 20ms
-  sensor2.setMeasurementTimingBudget(20000);
-  sensor3.setMeasurementTimingBudget(20000);
-
-  // Iniciar medición continua
-  sensor1.startContinuous();
-  sensor2.startContinuous();
-  sensor3.startContinuous();
-
-  // Esperar el tiempo reglamentario de 5 segundos antes de comenzar
-  Serial.println("Esperando 5 segundos para iniciar...");
-  delay(5000);
-
-  Serial.println("¡Robot minisumo activado!");
+  // Par derecho adelante
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+  analogWrite(ENB, speed);
 }
 
-void loop()
+void forwardAttack()
 {
-  // Leer sensores
-  dist1 = sensor1.readRangeContinuousMillimeters();
-  dist2 = sensor2.readRangeContinuousMillimeters();
-  dist3 = sensor3.readRangeContinuousMillimeters();
+  moveForward(ATTACK_SPEED);
+}
 
-  // Validar lecturas (eliminar valores 0 o fuera de rango)
-  if (dist1 == 0 || dist1 > MAX_VALID_DISTANCE)
-    dist1 = MAX_VALID_DISTANCE;
-  if (dist2 == 0 || dist2 > MAX_VALID_DISTANCE)
-    dist2 = MAX_VALID_DISTANCE;
-  if (dist3 == 0 || dist3 > MAX_VALID_DISTANCE)
-    dist3 = MAX_VALID_DISTANCE;
+// Control de motores con PWM para L298N
 
-  // Mostrar datos para depuración
-  Serial.print("F:");
-  Serial.print(dist1);
-  Serial.print(" I:");
-  Serial.print(dist2);
-  Serial.print(" D:");
-  Serial.println(dist3);
+void moveBackward(int speed)
+{
+  // Par izquierdo atrás
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  analogWrite(ENA, speed);
 
-  // Verificar si estamos posiblemente estancados
-  checkIfStuck();
+  // Par derecho atrás
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+  analogWrite(ENB, speed);
+}
 
-  // Lógica de control principal
-  if (isStuck)
+void turnLeft(int speed)
+{
+  // Par izquierdo atrás
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  analogWrite(ENA, speed);
+
+  // Par derecho adelante
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+  analogWrite(ENB, speed);
+}
+
+void turnRight(int speed)
+{
+  // Par izquierdo adelante
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  analogWrite(ENA, speed);
+
+  // Par derecho atrás
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+  analogWrite(ENB, speed);
+}
+
+void stopMotors()
+{
+  // Todos los motores detenidos
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  analogWrite(ENA, 0);
+
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+  analogWrite(ENB, 0);
+}
+
+// Actualizar la acción actual según prioridades
+void updateCurrentAction()
+{
+  // Verificar detección de borde (prioridad máxima)
+  if (!tcrtFrontValue || !tcrtBackValue)
   {
-    // Ejecutar maniobra de escape si estamos estancados
-    escapeManeuver();
+    currentAction = PRIORITY_EDGE;
+    edgeDetected = true;
+    return;
   }
-  else if (dist1 < OPPONENT_THRESHOLD && dist1 > MIN_VALID_DISTANCE)
+  else
+  {
+    edgeDetected = false;
+  }
+
+  // Verificar detección de oponente (segunda prioridad)
+  if ((dist1 < OPPONENT_THRESHOLD && dist1 > MIN_VALID_DISTANCE) ||
+      (dist2 < OPPONENT_THRESHOLD && dist2 > MIN_VALID_DISTANCE) ||
+      (dist3 < OPPONENT_THRESHOLD && dist3 > MIN_VALID_DISTANCE))
+  {
+    currentAction = PRIORITY_ATTACK;
+    return;
+  }
+
+  // Si no hay borde ni oponente, modo búsqueda
+  currentAction = PRIORITY_SEARCH;
+}
+
+// Maniobra para evitar salirse del dohyo
+void avoidEdge()
+{
+  // Detener motores brevemente
+  stopMotors();
+  delay(50);
+
+  // Determinar qué sensor detectó el borde
+  if (!tcrtFrontValue)
+  {
+    Serial.println("¡Borde detectado ADELANTE! Retrocediendo...");
+    // Si el sensor frontal detecta el borde, retroceder
+    moveBackward(EDGE_RETREAT_SPEED);
+    delay(300); // Retroceder durante un tiempo suficiente
+
+    // Girar para alejarse más del borde
+    turnRight(TURN_SPEED);
+    delay(200);
+  }
+  else if (!tcrtBackValue)
+  {
+    Serial.println("¡Borde detectado ATRÁS! Avanzando...");
+    // Si el sensor trasero detecta el borde, avanzar
+    moveForward(EDGE_RETREAT_SPEED);
+    delay(300); // Avanzar durante un tiempo suficiente
+
+    // Girar para alejarse más del borde
+    turnRight(TURN_SPEED);
+    delay(200);
+  }
+
+  // Actualizar tiempo de último movimiento para evitar detección de estancamiento
+  lastMoveChange = millis();
+}
+
+// Función para atacar al oponente según la posición detectada
+void attackOpponent()
+{
+  if (dist1 < OPPONENT_THRESHOLD && dist1 > MIN_VALID_DISTANCE)
   {
     // ESCENARIO 1: Oponente al frente - Ataque directo
     Serial.println("¡Ataque frontal!");
     forwardAttack();
-    lastMoveChange = millis();
   }
   else if (dist2 < OPPONENT_THRESHOLD && dist2 > MIN_VALID_DISTANCE)
   {
@@ -173,7 +214,6 @@ void loop()
     turnLeft(TURN_SPEED);
     delay(100); // Pequeña pausa para completar el giro
     forwardAttack();
-    lastMoveChange = millis();
   }
   else if (dist3 < OPPONENT_THRESHOLD && dist3 > MIN_VALID_DISTANCE)
   {
@@ -182,16 +222,9 @@ void loop()
     turnRight(TURN_SPEED);
     delay(100); // Pequeña pausa para completar el giro
     forwardAttack();
-    lastMoveChange = millis();
-  }
-  else
-  {
-    // ESCENARIO 4: Sin detección - Modo búsqueda
-    searchMode();
   }
 
-  // Pequeña pausa para estabilidad
-  delay(10);
+  lastMoveChange = millis();
 }
 
 // Función para verificar estancamiento
@@ -261,73 +294,152 @@ void searchMode()
 }
 
 // Ataque directo a máxima potencia
-void forwardAttack()
+
+void setup()
 {
-  moveForward(ATTACK_SPEED);
+  Serial.begin(9600); // Iniciar comunicación serial
+
+  // Configurar pines de motores como salidas
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+  pinMode(ENA, OUTPUT);
+  pinMode(ENB, OUTPUT);
+
+  // Configurar pines de sensores TCRT5000 como entradas
+  pinMode(TCRT_FRONT, INPUT);
+  pinMode(TCRT_BACK, INPUT);
+
+  // Apagar motores inicialmente
+  stopMotors();
+
+  // Configurar pines XSHUT como salidas
+  pinMode(XSHUT_PIN1, OUTPUT);
+  pinMode(XSHUT_PIN2, OUTPUT);
+  pinMode(XSHUT_PIN3, OUTPUT);
+
+  // Apagar todos los sensores
+  digitalWrite(XSHUT_PIN1, LOW);
+  digitalWrite(XSHUT_PIN2, LOW);
+  digitalWrite(XSHUT_PIN3, LOW);
+  delay(5);
+
+  // Iniciar Wire/I2C
+  Wire.begin();
+
+  // === INICIALIZAR SENSORES UNO POR UNO ===
+
+  // Inicializar sensor frontal
+  digitalWrite(XSHUT_PIN1, HIGH);
+  delay(5);
+  if (!sensor1.init())
+  {
+    Serial.println("Error inicializando sensor frontal");
+  }
+  sensor1.setAddress(LOX1_ADDRESS);
+  sensor1.setTimeout(50);
+
+  // Inicializar sensor izquierdo
+  digitalWrite(XSHUT_PIN2, HIGH);
+  delay(5);
+  if (!sensor2.init())
+  {
+    Serial.println("Error inicializando sensor izquierdo");
+  }
+  sensor2.setAddress(LOX2_ADDRESS);
+  sensor2.setTimeout(50);
+
+  // Inicializar sensor derecho
+  digitalWrite(XSHUT_PIN3, HIGH);
+  delay(5);
+  if (!sensor3.init())
+  {
+    Serial.println("Error inicializando sensor derecho");
+  }
+  sensor3.setAddress(LOX3_ADDRESS);
+  sensor3.setTimeout(50);
+
+  // Configurar sensores para modo rápido
+  sensor1.setMeasurementTimingBudget(20000); // 20ms
+  sensor2.setMeasurementTimingBudget(20000);
+  sensor3.setMeasurementTimingBudget(20000);
+
+  // Iniciar medición continua
+  sensor1.startContinuous();
+  sensor2.startContinuous();
+  sensor3.startContinuous();
+
+  // Esperar el tiempo reglamentario de 5 segundos antes de comenzar
+  Serial.println("Esperando 5 segundos para iniciar...");
+  delay(4000);
+
+  Serial.println("¡Robot minisumo activado!");
 }
 
-// Control de motores con PWM para L298N
-
-void moveForward(int speed)
+void loop()
 {
-  // Par izquierdo adelante
-  digitalWrite(IN1, HIGH);
-  digitalWrite(IN2, LOW);
-  analogWrite(ENA, speed);
+  // Leer sensores de distancia
+  dist1 = sensor1.readRangeContinuousMillimeters();
+  dist2 = sensor2.readRangeContinuousMillimeters();
+  dist3 = sensor3.readRangeContinuousMillimeters();
 
-  // Par derecho adelante
-  digitalWrite(IN3, HIGH);
-  digitalWrite(IN4, LOW);
-  analogWrite(ENB, speed);
-}
+  // Leer sensores de línea TCRT5000
+  tcrtFrontValue = digitalRead(TCRT_FRONT);
+  tcrtBackValue = digitalRead(TCRT_BACK);
 
-void moveBackward(int speed)
-{
-  // Par izquierdo atrás
-  digitalWrite(IN1, LOW);
-  digitalWrite(IN2, HIGH);
-  analogWrite(ENA, speed);
+  // Validar lecturas de sensores de distancia
+  if (dist1 == 0 || dist1 > MAX_VALID_DISTANCE)
+    dist1 = MAX_VALID_DISTANCE;
+  if (dist2 == 0 || dist2 > MAX_VALID_DISTANCE)
+    dist2 = MAX_VALID_DISTANCE;
+  if (dist3 == 0 || dist3 > MAX_VALID_DISTANCE)
+    dist3 = MAX_VALID_DISTANCE;
 
-  // Par derecho atrás
-  digitalWrite(IN3, LOW);
-  digitalWrite(IN4, HIGH);
-  analogWrite(ENB, speed);
-}
+  // Mostrar datos para depuración
+  Serial.print("F:");
+  Serial.print(dist1);
+  Serial.print(" I:");
+  Serial.print(dist2);
+  Serial.print(" D:");
+  Serial.print(dist3);
+  Serial.print(" TCRT-F:");
+  Serial.print(tcrtFrontValue);
+  Serial.print(" TCRT-B:");
+  Serial.println(tcrtBackValue);
 
-void turnLeft(int speed)
-{
-  // Par izquierdo atrás
-  digitalWrite(IN1, LOW);
-  digitalWrite(IN2, HIGH);
-  analogWrite(ENA, speed);
+  // Verificar si estamos posiblemente estancados
+  checkIfStuck();
 
-  // Par derecho adelante
-  digitalWrite(IN3, HIGH);
-  digitalWrite(IN4, LOW);
-  analogWrite(ENB, speed);
-}
+  // Determinar la acción de mayor prioridad
+  updateCurrentAction();
 
-void turnRight(int speed)
-{
-  // Par izquierdo adelante
-  digitalWrite(IN1, HIGH);
-  digitalWrite(IN2, LOW);
-  analogWrite(ENA, speed);
+  // Ejecutar la acción de acuerdo a la prioridad
+  switch (currentAction)
+  {
+  case PRIORITY_EDGE:
+    // Maniobra para evitar salirse del dohyo
+    avoidEdge();
+    break;
 
-  // Par derecho atrás
-  digitalWrite(IN3, LOW);
-  digitalWrite(IN4, HIGH);
-  analogWrite(ENB, speed);
-}
+  case PRIORITY_ATTACK:
+    // Atacar al oponente
+    attackOpponent();
+    break;
 
-void stopMotors()
-{
-  // Todos los motores detenidos
-  digitalWrite(IN1, LOW);
-  digitalWrite(IN2, LOW);
-  analogWrite(ENA, 0);
+  case PRIORITY_SEARCH:
+    // Modo búsqueda
+    if (isStuck)
+    {
+      escapeManeuver();
+    }
+    else
+    {
+      searchMode();
+    }
+    break;
+  }
 
-  digitalWrite(IN3, LOW);
-  digitalWrite(IN4, LOW);
-  analogWrite(ENB, 0);
+  // Pequeña pausa para estabilidad
+  delay(10);
 }
