@@ -47,7 +47,8 @@ const unsigned long STUCK_TIMEOUT = 3500;      // Tiempo para detectar estancami
 
 // Variables para almacenar mediciones
 uint16_t dist1, dist2, dist3;
-bool isLineFrontDetected, isLineBackDetected;
+bool isLineFrontDetected = true;
+bool isLineBackDetected = true;
 
 // Variables de control
 unsigned long lastSearchChange = 0; // Tiempo de último cambio de dirección de búsqueda
@@ -327,9 +328,25 @@ void loop()
   dist1 = sensor1.readRangeContinuousMillimeters();
   dist2 = sensor2.readRangeContinuousMillimeters();
   dist3 = sensor3.readRangeContinuousMillimeters();
+  // Serial.print("Distancias: ");
+  // Serial.print("frente: ");
+  // Serial.print(dist1);
+  // Serial.print(" mm, ");
+  // Serial.print("izquierdo: ");
+  // Serial.print(dist2);
+  // Serial.print(" mm, ");
+  // Serial.print("derecho: ");
+  // Serial.print(dist3);
+  // Serial.println(" mm");
 
-  isLineFrontDetected = digitalRead(TCRT_FRONT);
-  isLineBackDetected = digitalRead(TCRT_BACK);
+  // isLineFrontDetected = digitalRead(TCRT_FRONT);
+  // isLineBackDetected = digitalRead(TCRT_BACK);
+  // Serial.print("Lineas: ");
+  // Serial.print("frente: ");
+  // Serial.print(isLineFrontDetected);
+  // Serial.print(", ");
+  // Serial.print("atrás: ");
+  // Serial.println(isLineBackDetected);
 
   if (dist1 == 0 || dist1 > MAX_VALID_DISTANCE)
     dist1 = MAX_VALID_DISTANCE;
